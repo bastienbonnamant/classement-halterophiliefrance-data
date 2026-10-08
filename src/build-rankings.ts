@@ -7,6 +7,7 @@
  *   npm run build -- --season=8  # one given season
  *   npm run build -- --all       # every season (3 .. current)
  *   npm run build -- --limit=15  # only the first N competitions (smoke test)
+ *   npm run build -- --index-only # rebuild index.json from the existing files
  */
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -63,9 +64,11 @@ function clubHomeRegions(rows: { club: string | null; league: string | null }[])
 }
 
 async function buildSeason(seasonId: number, limit?: number) {
-  const refs = parseSeasonList(await politeFetch(SEASON_URL(seasonId))).filter((c) => c.individual);
+  // Compétitions individuelles ET par équipes (Top 9, N1…) : les pages d'équipes listent aussi la
+  // performance de chaque athlète (arraché, épaulé-jeté, total, points IWF), souvent sa meilleure de la saison.
+  const refs = parseSeasonList(await politeFetch(SEASON_URL(seasonId)));
   const targets = limit ? refs.slice(0, limit) : refs;
-  console.log(`Saison ${seasonId}: ${targets.length}/${refs.length} compétitions individuelles`);
+  console.log(`Saison ${seasonId}: ${targets.length}/${refs.length} compétitions (${refs.filter((c) => !c.individual).length} par équipes)`);
 
   const { results: details, errors } = await politeBatch(targets, async (c) =>
     parseCompetitionResults(await politeFetch(c.url), c.sourceId),
@@ -79,7 +82,8 @@ async function buildSeason(seasonId: number, limit?: number) {
   const rows: Row[] = [];
   for (const d of details) {
     for (const r of d.results) {
-      if (r.total === null) continue;
+      // Total absent ou nul : athlète inscrit à une compétition pas encore disputée, ou sans barre valide.
+      if (r.total === null || r.total <= 0) continue;
       rows.push({
         n: r.name,
         l: r.licenceNumber,
@@ -105,16 +109,29 @@ async function buildSeason(seasonId: number, limit?: number) {
   return rows;
 }
 
+/** Une saison entame le classement par défaut quand elle compte au moins ce nombre d'athlètes. */
+const MIN_ATHLETES_FOR_DEFAULT = 1000;
+
+/**
+ * index.json liste les saisons ; la première est celle sur laquelle s'ouvre le widget.
+ * C'est la plus récente qui compte assez d'athlètes : en début de saison, quelques
+ * compétitions ne suffisent pas à faire un "top 100", on garde donc la saison précédente
+ * en tête jusqu'à ce que la nouvelle soit bien remplie.
+ */
 async function writeIndex() {
   const files = (await readdir(OUT_DIR)).filter((f) => /^\d+\.json$/.test(f));
-  const seasons = [];
+  const seasons: { id: number; label: string; updatedAt: string; athletes: number; default?: boolean }[] = [];
   for (const f of files) {
     const id = Number(f.replace(".json", ""));
     const data = JSON.parse(await readFile(path.join(OUT_DIR, f), "utf8"));
-    seasons.push({ id, label: seasonLabelForSourceId(id), updatedAt: data.updatedAt });
+    const athletes = new Set((data.rows as Row[]).map((r) => r.l)).size;
+    seasons.push({ id, label: seasonLabelForSourceId(id), updatedAt: data.updatedAt, athletes });
   }
   seasons.sort((a, b) => b.id - a.id);
-  await writeFile(path.join(OUT_DIR, "index.json"), JSON.stringify({ seasons }) + "\n");
+  const preferred = seasons.find((s) => s.athletes >= MIN_ATHLETES_FOR_DEFAULT) ?? seasons[0];
+  if (preferred) preferred.default = true;
+  const ordered = preferred ? [preferred, ...seasons.filter((s) => s !== preferred)] : seasons;
+  await writeFile(path.join(OUT_DIR, "index.json"), JSON.stringify({ seasons: ordered }) + "\n");
 }
 
 async function main() {
@@ -126,6 +143,10 @@ async function main() {
   const limit = arg("limit") ? Number(arg("limit")) : undefined;
 
   await mkdir(OUT_DIR, { recursive: true });
+  if (process.argv.includes("--index-only")) {
+    await writeIndex();
+    return;
+  }
   for (const id of seasonIds) {
     const rows = await buildSeason(id, limit);
     if (rows.length === 0) {
