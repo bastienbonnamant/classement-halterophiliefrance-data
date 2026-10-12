@@ -46,19 +46,63 @@ function arg(name: string): string | undefined {
  * athletes appear most often. National events ("FRANCE") are hosted everywhere,
  * so they only count when a club has no regional result at all.
  */
-function clubHomeRegions(rows: { club: string | null; league: string | null }[]) {
-  const counts = new Map<string, Map<string, number>>();
-  for (const { club, league } of rows) {
+function clubHomeRegions(
+  rows: { club: string | null; league: string | null; team: boolean }[],
+  prior: Map<string, string> = new Map(),
+) {
+  // Trois niveaux, du plus fiable au moins fiable :
+  //  1. la région déjà connue du club dans les saisons précédentes (une saison entière de résultats) ;
+  //  2. sinon, les compétitions individuelles régionales de la saison (hors par équipes et "FRANCE") ;
+  //  3. à défaut, n'importe quelle compétition de la saison.
+  // En début de saison, un club n'a couru que quelques compétitions, souvent organisées dans une autre
+  // ligue (Top 9, plateaux ouverts) : ces votes donneraient une fausse région.
+  const regional = new Map<string, Map<string, number>>();
+  const any = new Map<string, Map<string, number>>();
+  const add = (m: Map<string, Map<string, number>>, key: string, league: string) => {
+    const byLeague = m.get(key) ?? new Map<string, number>();
+    byLeague.set(league, (byLeague.get(league) ?? 0) + 1);
+    m.set(key, byLeague);
+  };
+  for (const { club, league, team } of rows) {
     if (!club || !league) continue;
     const key = club.trim().toUpperCase();
-    const byLeague = counts.get(key) ?? new Map<string, number>();
-    byLeague.set(league, (byLeague.get(league) ?? 0) + 1);
-    counts.set(key, byLeague);
+    add(any, key, league);
+    if (!team && league !== "FRANCE") add(regional, key, league);
   }
-  const home = new Map<string, string>();
-  for (const [key, byLeague] of counts) {
+  const top = (byLeague: Map<string, number>, skipFrance: boolean) => {
     const ranked = [...byLeague.entries()].sort((a, b) => b[1] - a[1]);
-    home.set(key, (ranked.find(([league]) => league !== "FRANCE") ?? ranked[0])[0]);
+    return (skipFrance ? ranked.find(([league]) => league !== "FRANCE") : undefined)?.[0] ?? ranked[0][0];
+  };
+  const home = new Map<string, string>();
+  for (const [key, byLeague] of any) {
+    const reg = regional.get(key);
+    home.set(key, prior.get(key) ?? (reg ? top(reg, true) : top(byLeague, true)));
+  }
+  return home;
+}
+
+/** Région d'attache de chaque club d'après les saisons déjà construites (la plus récente d'abord). */
+async function priorHomeRegions(seasonId: number) {
+  const home = new Map<string, string>();
+  for (let id = seasonId - 1; id >= 1; id--) {
+    let data: { rows: Row[] };
+    try {
+      data = JSON.parse(await readFile(path.join(OUT_DIR, `${id}.json`), "utf8"));
+    } catch {
+      continue;
+    }
+    const counts = new Map<string, Map<string, number>>();
+    for (const r of data.rows) {
+      if (!r.c || !r.r || r.r === "FRANCE") continue;
+      const key = r.c.trim().toUpperCase();
+      if (home.has(key)) continue; // une saison plus récente a déjà tranché
+      const byRegion = counts.get(key) ?? new Map<string, number>();
+      byRegion.set(r.r, (byRegion.get(r.r) ?? 0) + 1);
+      counts.set(key, byRegion);
+    }
+    for (const [key, byRegion] of counts) {
+      home.set(key, [...byRegion.entries()].sort((a, b) => b[1] - a[1])[0][0]);
+    }
   }
   return home;
 }
@@ -75,9 +119,20 @@ async function buildSeason(seasonId: number, limit?: number) {
   );
   if (errors.length) console.warn(`${errors.length} compétition(s) en échec (ignorées)`);
 
+  const teamIds = new Set(refs.filter((c) => !c.individual).map((c) => c.sourceId));
   const home = clubHomeRegions(
-    details.flatMap((d) => d.results.map((r) => ({ club: r.club, league: d.league }))),
+    details.flatMap((d) =>
+      d.results.map((r) => ({ club: r.club, league: d.league, team: teamIds.has(d.sourceId) })),
+    ),
+    await priorHomeRegions(seasonId),
   );
+  // Corrections manuelles éventuelles : club-regions.json, ex. { "EEAR MONTEUX": "PROVENCE-ALPES-COTE D'AZUR" }
+  try {
+    const manual = JSON.parse(await readFile(path.join(process.cwd(), "club-regions.json"), "utf8")) as Record<string, string>;
+    for (const [club, region] of Object.entries(manual)) home.set(club.trim().toUpperCase(), region);
+  } catch {
+    /* pas de fichier de corrections : on garde les régions calculées */
+  }
 
   const rows: Row[] = [];
   for (const d of details) {
